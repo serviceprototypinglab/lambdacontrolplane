@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+#
+# LaMa: Lambda Management interface database
+# Query frontend taken from StealthDB
+
+import re
+import sys
+import os
+import readline
+import json
+import boto3
+
+class LaMaColumn:
+	def __init__(self, name, coltype, options):
+		self.name = name
+		self.coltype = coltype
+		self.options = options
+
+		self.lambda_client = boto3.client('lambda')
+
+	def getentriessorted(self, orderdirection):
+		return []
+
+	def getentries(self, whereoperator=None, wherevalue=None, distinct=None):
+		return []
+
+	def getrows(self):
+		conf = self.lambda_client.get_function_configuration(FunctionName="database")
+		envvar = conf["Environment"]["Variables"]
+		return len(envvar.get("C" + self.name.upper(), "").split(";"))
+
+	def addentry(self, v):
+		conf = self.lambda_client.get_function_configuration(FunctionName="database")
+		envvar = conf["Environment"]["Variables"]
+		envvar["C" + self.name.upper()] = ";".join([v] + envvar.get("C" + self.name.upper(), "").split(";"))
+		self.lambda_client.update_function_configuration(FunctionName="database", Environment={"Variables": envvar})
+
+	def remove(self):
+		conf = self.lambda_client.get_function_configuration(FunctionName="database")
+		envvar = conf["Environment"]["Variables"]
+		del envvar["C" + self.name.upper()]
+		self.lambda_client.update_function_configuration(FunctionName="database", Environment={"Variables": envvar})
+
+class LaMaTable:
+	def __init__(self, name):
+		self.name = name
+		self.columns = {}
+
+	def addcolumn(self, colname, coltype, coltypeoptions, coloptions):
+		self.columns[colname] = LaMaColumn(colname, coltype, coloptions)
+
+	def removecolumn(self, colname):
+		del self.columns[colname]
+
+class LaMa:
+	def __init__(self):
+		self.output("~~ LaMa ~~")
+		# http://www.ascii-art.de/ascii/jkl/llama.txt From:"C.Y./J.E.Cripps"
+		self.output("\\\\")
+		self.output("lo> <<")
+		self.output("ll")
+		self.output("llama~")
+		self.output("|| ||")
+		self.output("'' ''")
+		self.output("Type HELP; to get started.")
+
+		self.lambda_client = boto3.client('lambda')
+
+		self.loop()
+
+	def loop(self):
+		inputstr = ""
+		while True:
+			try:
+				s = self.input(inputstr != "")
+			except EOFError:
+				self.output("<Ctrl+D>")
+				self.output("Quitting...")
+				sys.exit(0)
+			except KeyboardInterrupt:
+				self.output("<Ctrl+C>")
+				s = ""
+				inputstr = ""
+			if len(inputstr) > 0:
+				inputstr += " "
+			s = s.replace("\t", "")
+			inputstr += s
+			if not os.isatty(sys.stdin.fileno()):
+				self.outputstandard(s)
+			if len(inputstr) > 0 and inputstr[-1] == ";":
+				try:
+					self.process(inputstr[:-1])
+				except Exception as e:
+					self.outputerror("EXCEPTION: %s" % str(e))
+				inputstr = ""
+
+	def loadtables(self):
+		tables = {}
+
+		# FIXME: unreliable payload read; perhaps a boto issue, not reproducible with awscli
+		#response = self.lambda_client.invoke(FunctionName="database", Payload="{\"admin\": \"tables\"}")
+		#self.outputdebug("Response(admin:tables):>>>" + str(response))
+		#responsestr = response["Payload"].read().decode("utf-8")
+		#self.outputdebug("Tables:>>>" + responsestr)
+		#tabledict = json.loads(responsestr)
+
+		conf = self.lambda_client.get_function_configuration(FunctionName="database")
+		envvar = conf["Environment"]["Variables"]
+		tablenames = envvar.get("DT", "").split(";")
+		if "" in tablenames:
+			tablenames.remove("")
+		tabledict = {}
+		for tablename in tablenames:
+			tabledict[tablename] = [x.lower() for x in envvar.get("T" + tablename.upper(), "T").split(";")]
+		self.outputdebug("Tables:>>>" + str(tabledict))
+
+		for tablename in tabledict:
+			tables[tablename] = LaMaTable(tablename)
+			for column in tabledict[tablename]:
+				tables[tablename].addcolumn(column, "DYNAMIC", None, None)
+		return tables
+
+	def output(self, s):
+		col_on = "\x1b[33m\x1b[1m"
+		col_off = "\x1b[0m"
+		print(col_on + s + col_off)
+
+	def outputstandard(self, s):
+		col_on = "\x1b[0m"
+		col_off = "\x1b[0m"
+		print(col_on + s + col_off)
+
+	def outputdata(self, s):
+		col_on = "\x1b[32m\x1b[1m"
+		col_off = "\x1b[0m"
+		print(col_on + s + col_off)
+
+	def outputerror(self, s):
+		col_on = "\x1b[31m\x1b[1m"
+		col_off = "\x1b[0m"
+		print(col_on + s + col_off)
+
+	def outputdebug(self, s):
+		return
+		col_on = "\x1b[34m\x1b[1m"
+		col_off = "\x1b[0m"
+		print(col_on + str(s) + col_off)
+
+	def input(self, continuation=False):
+		prompt = ""
+		col_on = "\x1b[32m\x1b[1m"
+		col_off = "\x1b[0m"
+		sign = ">>>"
+		if continuation:
+			sign = "..."
+		prompt = col_on + sign + " " + col_off
+		s = input(prompt)
+		return s
+
+	def extre(self, s):
+		r_sub = re.compile(" ([^\*])")
+		exts = r_sub.sub(" +\\1", s) + "$"
+		return exts
+
+	def process(self, s):
+		r_help = re.compile(self.extre("HELP(?: (\S+))?"))
+		r_show = re.compile(self.extre("SHOW (\S+)"))
+		r_create = re.compile(self.extre("CREATE TABLE (\S+)(?: \( *((?:(?:\S+) (?:\S+),? *)+)\))?"))
+		r_drop = re.compile(self.extre("DROP TABLE (?:(IF EXISTS) )?(\S+)"))
+		r_describe = re.compile(self.extre("DESCRIBE (\S+)"))
+		r_select = re.compile(self.extre("SELECT (?:(DISTINCT) )?((?:(?:\S+)(?:, *)?)+)(?: FROM (\S+))?(?: WHERE (\S+) (=|<|>|<>|<=|>=|(?:NOT )?LIKE) (\S+))?(?: ORDER BY (\S+)(?: (ASC|DESC))?)?"))
+		r_insert = re.compile(self.extre("INSERT INTO (\S+) \(((?:(?:\S+)(?:, *)?)+)\) VALUES \(((?:(?:\'[^\']*\'|\S+)(?:, *)?)+)\)"))
+		r_delete = re.compile(self.extre("DELETE FROM (\S+)"))
+
+		su = s.upper()
+
+		m_help = r_help.match(su)
+		if m_help:
+			topic = m_help.group(1)
+			if not topic:
+				self.output("LaMa Quickhelp")
+				self.output(" HELP [<topic>]")
+				self.output(" SHOW TABLES")
+				self.output(" CREATE TABLE <table> [(<column> <column-type>, ...)]")
+				self.output(" DESCRIBE <table>")
+				self.output(" DROP TABLE [IF EXISTS] <table>")
+				self.output(" SELECT [DISTINCT] */<column>/<aggregate>(*/<column>)/<predicate>, ... [FROM <table>]")
+				self.output("  [WHERE <column> LIKE/=/... <value>] [ORDER BY <column> [ASC|DESC]]")
+				self.output(" INSERT INTO <table> (<column>, ...) VALUES (<value>, ...)")
+				self.output(" DELETE FROM <table>")
+			elif topic == "COLUMN-TYPE":
+				self.output("Column types: DYNAMIC")
+			elif topic == "AGGREGATE":
+				self.output("Aggregates: ('COUNT', 'SUM', 'AVG', 'MEDIAN', 'MIN', 'MAX')")
+			elif topic == "PREDICATE":
+				self.output("Predicates: ('ROUND', 'ABS', 'SIN', 'COS', 'TAN', 'SQRT', 'UPPER', 'LOWER', 'LENGTH')")
+			elif topic in ("TABLE", "COLUMN", "VALUE"):
+				self.output("Sorry, cannot help you with your own problems.")
+			else:
+				self.outputerror("No help on %s." % topic)
+			return
+
+		m_show = r_show.match(su)
+		if m_show:
+			thing = m_show.group(1)
+			if thing == "TABLES":
+				self.output("Tables in database:")
+				for tablename in self.loadtables():
+					self.output("%% %s" % tablename)
+				return
+			else:
+				self.outputerror("Cannot show %s." % thing)
+			return
+
+		m_create = r_create.match(su)
+		if m_create:
+			tablename = m_create.group(1).lower()
+			tables = self.loadtables()
+			if tablename in tables:
+				self.outputerror("Table '%s' already exists." % tablename)
+				self.outputdebug(tables)
+				return
+
+			table = LaMaTable(tablename)
+
+			if m_create.group(2):
+				p_columnnames = m_create.group(2).lower()
+				r_names = re.compile("(\S+) +(\w+\((?:\d+|\S+)\)|\w+)((?: +\(?`?\w+`?\)?)*)(?:, *)?")
+				columnnames = r_names.findall(p_columnnames)
+
+				for columnname in columnnames:
+					colname = columnname[0]
+					coltype = columnname[1].upper()
+
+					if colname == "primary" and coltype == "KEY":
+						r_primary = re.compile(" *\((\S+)\)")
+						primary = r_primary.match(columnname[2]).groups(1)[0]
+						primary = primary.replace("`", "")
+						continue
+					elif colname == "constraint" or colname == "check":
+						continue
+
+					colname = colname.replace("`", "")
+
+					p_columnoptions = columnname[2]
+					r_options = re.compile("(null|not null|auto_increment)")
+					coloptions = r_options.findall(p_columnoptions)
+
+					if coltype in ("DYNAMIC",):
+						table.addcolumn(colname, coltype, None, coloptions)
+						self.output("Added column %s of type %s." % (colname, coltype))
+					else:
+						matchlist = [x for x in ("DYNAMIC",) if re.match(x, coltype)]
+						if len(matchlist) == 1:
+							coltypeoptions = re.match(matchlist[0], coltype).group(1)
+							coltype = re.sub("\\\\\(.*\)", "", matchlist[0])
+							if coltype == "ENUM":
+								coltypeoptions = list(filter(lambda x: x and x != ",", coltypeoptions.split("'")))
+							table.addcolumn(colname, coltype, coltypeoptions, coloptions)
+							self.output("Added column %s of type %s {%s}." % (colname, coltype, coltypeoptions))
+						else:
+							self.outputerror("Unknown column type '%s' for %s; choose from %s." % (coltype, colname, str(("DYNAMIC",))))
+
+			conf = self.lambda_client.get_function_configuration(FunctionName="database")
+			envvar = conf["Environment"]["Variables"]
+			envvar["DT"] = ";".join([tablename] + envvar.get("DT", "").split(";"))
+			envvar["T" + tablename.upper()] = ";".join(list(table.columns.keys()))
+			response = self.lambda_client.update_function_configuration(FunctionName="database", Environment={"Variables": envvar})
+			self.outputdebug(response)
+			self.output("Created table %s." % tablename)
+			return
+
+		m_describe = r_describe.match(su)
+		if m_describe:
+			tablename = m_describe.group(1).lower()
+			tables = self.loadtables()
+			if not tablename in tables:
+				self.outputerror("Table '%s' does not exist." % tablename)
+				return
+
+			table = tables[tablename]
+			for colname in list(table.columns):
+				options = ""
+				if table.columns[colname].options:
+					options = " %s" % table.columns[colname].options
+				self.outputdata("Column %s [%s]%s" % (colname, table.columns[colname].coltype, options))
+			return
+
+		m_drop = r_drop.match(su)
+		if m_drop:
+			ifexists = None
+			if m_drop.group(1) != None:
+				ifexists = m_drop.group(1).lower()
+			tablename = m_drop.group(2).lower()
+			tables = self.loadtables()
+			if not tablename in tables:
+				if not ifexists:
+					self.outputerror("Table '%s' does not exist." % tablename)
+				return
+
+			conf = self.lambda_client.get_function_configuration(FunctionName="database")
+			envvar = conf["Environment"]["Variables"]
+			table = tables[tablename]
+			for colname in list(table.columns):
+				del envvar["C" + colname.upper()]
+			del envvar["T" + tablename.upper()]
+			del tables[tablename]
+			envvar["DT"] = ";".join(tables.keys())
+			response = self.lambda_client.update_function_configuration(FunctionName="database", Environment={"Variables": envvar})
+			self.outputdebug(response)
+			self.output("Removed table %s." % tablename)
+			return
+
+		m_select = r_select.match(su)
+		if m_select:
+			response = self.lambda_client.invoke(FunctionName="database", Payload="{\"query\": \"" + su + "\"}")
+			responsestr = response["Payload"].read().decode("utf-8")
+			self.output(responsestr)
+			return
+
+		m_insert = r_insert.match(su)
+		if m_insert:
+			tablename = m_insert.group(1).lower()
+			colname = m_insert.group(2).lower()
+			value = m_insert.group(3).lower()
+
+			p_colnames = m_insert.group(2).lower()
+			r_colnames = re.compile("(\S+)(?:, )?")
+			colnames = r_colnames.findall(p_colnames)
+
+			p_values = m_insert.group(3).lower()
+			r_values = re.compile("(\'[^\']*\'|\S+)(?:, )?")
+			values = r_values.findall(p_values)
+
+			inserttransaction = {}
+			tables = self.loadtables()
+			if tablename in tables:
+				table = tables[tablename]
+				for colname, value in zip(colnames, values):
+					colname = colname.replace(",", "")
+					value = value.replace(",", "")
+					if colname in table.columns:
+						column = table.columns[colname]
+						if value[0] == "'" and value[-1] == "'":
+							value = value[1:-1]
+						elif value[0] == "\"" and value[-1] == "\"":
+							value = value[1:-1]
+						inserttransaction[column] = value
+					else:
+						self.outputerror("Non-existing column %s." % colname)
+						return
+				for column in inserttransaction:
+					column.addentry(inserttransaction[column])
+				self.output("Inserted values into %i column(s)." % len(inserttransaction))
+			else:
+				self.outputerror("Non-existing table %s." % tablename)
+				self.outputdebug(tables)
+			return
+
+		m_delete = r_delete.match(su)
+		if m_delete:
+			tablename = m_delete.group(1).lower()
+			tables = self.loadtables()
+			table = tables[tablename]
+			for column in table.columns.values():
+				count = column.getrows()
+				column.remove()
+			self.output("Deleted all %i values from table %s." % (count, tablename))
+			return
+
+		self.outputerror("Syntax not understood.")
+
+lama = LaMa()

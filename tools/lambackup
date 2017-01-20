@@ -1,0 +1,261 @@
+#!/bin/bash
+#
+# lambackup: Backup files to and restore from AWS Lambda's control plane
+
+USE_TOC=1 # Record ToC with infos about all files; otherwise, remember yourself
+USE_LEN=1 # Record length for each file; otherwise, determine with try-and-error
+USE_FST=0 # Fast restore by invoking the function; set to 1 (not really fast; incurs cost due to Lambda calls)
+          # or 2 (fast; but incurs cost due to API Gateway) or 3 (superfast; incurs cost due to dispersed Lambda calls)
+
+if [ $USE_FST -eq 0 ]
+then
+	pseudocode="def f():pass"
+elif [ $USE_FST -eq 1 ]
+then
+	pseudocode="import os\ndef f(e, c):return os.getenv(\"LB\")"
+elif [ $USE_FST -eq 2 ]
+then
+	# As required by the API Gateway
+	pseudocode="import os\ndef f(e, c):return {\"statusCode\": 200, \"headers\": {}, \"body\": os.getenv(\"LB\")}"
+elif [ $USE_FST -eq 3 ]
+then
+	pseudocode="import os\ndef f(e, c):return os.getenv(\"LB\")"
+	aggregationcode="import json\nfrom boto3 import client as boto3_client\nlambda_client = boto3_client('lambda')\nimport os\ndef f(e, c):\n\tcomb = [\"a\", \"a\"]\n\tresponses = []\n\tfunctionname = os.getenv(\"functionname\")\n\twhile True:\n\t\ttry:\n\t\t\tresponse = lambda_client.invoke(FunctionName=functionname + \"LAMBACKUP\" + \"\".join(comb), Payload=\"{}\")\n\t\texcept:\n\t\t\tbreak\n\t\tresponse = json.loads(response[\"Payload\"].read()) #[\"body\"] for API Gateway\n\t\tresponses.append(response)\n\t\tif comb[1] == \"z\":\n\t\t\tcomb[1] = \"a\"\n\t\t\tcomb[0] = chr(ord(comb[1]) + 1)\n\t\telse:\n\t\t\tcomb[1] = chr(ord(comb[1]) + 1)\n\treturn \"\".join(responses)\n"
+else
+	echo "Configuration mistake: USE_FST=$USE_FST" >&2
+	exit 1
+fi
+
+if [ -z "$1" ] || [ $1 != backup -a $1 != restore -a $1 != list ] || [ $1 != list -a -z "$2" ] || [ $1 == backup -a ! -f "$2" ]
+then
+	echo "Syntax: $0 backup|restore <file>" >&2
+	if [ $USE_TOC -eq 1 ]
+	then
+		echo "        $0 list" >&2
+	fi
+	exit 1
+fi
+
+configdir=$HOME/.lambackup
+mkdir -p $configdir
+if [ ! -f $configdir/f.zip ]
+then
+	echo "Initialising functions."
+	echo -e $pseudocode > $configdir/f.py
+	(cd $configdir && zip -q f.zip f.py)
+fi
+if [ ! -f $configdir/awsrole ]
+then
+	#read -p "Your AWS Lambda execution role (e.g. arn:aws:iam::\\d{12}:role/lambda_basic_execution)? " role
+	awsacctid=`aws sts get-caller-identity --output text --query 'Account'`
+	role=arn:aws:iam::$awsacctid:role/lambda_basic_execution
+	echo $role > $configdir/awsrole
+else
+	role=`cat $configdir/awsrole`
+fi
+if [ $USE_FST -eq 2 ]
+then
+	mkdir -p $configdir/.api
+	if [ ! -f $configdir/.api/api-id ]
+	then
+		echo "Initialising API Gateway."
+		aws apigateway create-rest-api --name LBgate > $configdir/.api/api-id
+	fi
+	api_id=`python -c "import json; x = json.load(open('$configdir/.api/api-id')); print(x['id'])"`
+	if [ ! -f $configdir/.api/root-id ]
+	then
+		aws apigateway get-resources --rest-api-id $api_id > $configdir/.api/root-id
+	fi
+	root_id=`python -c "import json; x = json.load(open('$configdir/.api/root-id')); print(x['items'][0]['id'])"`
+
+	awsregion=`python -c "import ConfigParser; cp = ConfigParser.ConfigParser(); cp.read('$HOME/.aws/config'); print cp.get('default', 'region')"`
+	# Perhaps not reliable but saves one piece of configuration
+	if [ ! -f $configdir/awsaccount ]
+	then
+		aws sts get-caller-identity --output text --query 'Account' > $configdir/awsaccount
+	fi
+	awsacctid=`cat $configdir/awsaccount`
+
+	if [ ! -f $configdir/awsapigateway ]
+	then
+		#read -p "Your AWS API Gateway (e.g. apigateway=https://xxxxxxxxxx.execute-api.us-west-1.amazonaws.com)? " apigateway
+		apigateway=https://$api_id.execute-api.$awsregion.amazonaws.com
+		echo $apigateway > $configdir/awsapigateway
+	else
+		apigateway=`cat $configdir/awsapigateway`
+	fi
+elif [ $USE_FST -eq 3 ]
+then
+	if [ ! -f $configdir/a.zip ]
+	then
+		echo -e $aggregationcode > $configdir/a.py
+		(cd $configdir && zip -q a.zip a.py)
+	fi
+fi
+
+magiclimit=3063
+runtime=python2.7
+handler=f.f
+
+namehash=`echo $2 | md5sum | cut -d " " -f 1`
+
+case $1 in
+	backup)
+		split -b $magiclimit $2 LAMBACKUP
+		chunkcount=`ls -1 LAMBACKUP* | wc -l`
+		echo "Prepared $chunkcount chunks. Backup ..."
+		if [ $USE_LEN -eq 1 ]
+		then
+			aws lambda delete-function --function-name ${namehash}LEN >/dev/null 2>/dev/null
+			aws lambda create-function --function-name ${namehash}LEN --runtime $runtime --role $role --handler $handler --environment "Variables={LB=$chunkcount}" --zip-file fileb://$configdir/f.zip >/dev/null
+		fi
+		dodeploy=0
+		for chunk in LAMBACKUP*
+		do
+			cat $chunk | base64plain > $chunk.encoded
+			data=`cat $chunk.encoded`
+			aws lambda delete-function --function-name $namehash$chunk >/dev/null 2>/dev/null
+			aws lambda create-function --function-name $namehash$chunk --runtime $runtime --role $role --handler $handler --environment "Variables={LB=$data}" --zip-file fileb://$configdir/f.zip >/dev/null
+			rm -f $chunk $chunk.encoded
+			if [ $USE_FST -eq 2 ]
+			then
+				functionname=$namehash$chunk
+				aws apigateway create-resource --rest-api-id $api_id --parent-id $root_id --path-part $functionname > $configdir/.api/resource-id 2>/dev/null
+				if [ $? -eq 0 ]
+				then
+					resource_id=`python -c "import json; x = json.load(open('$configdir/.api/resource-id')); print(x['id'])"`
+					aws apigateway put-method --rest-api-id $api_id --resource-id $resource_id --http-method POST --authorization-type NONE > $configdir/.api/resource-post
+					aws apigateway put-integration --rest-api-id $api_id --resource-id $resource_id --http-method POST --type AWS_PROXY --integration-http-method POST --uri arn:aws:apigateway:$awsregion:lambda:path/2015-03-31/functions/arn:aws:lambda:$awsregion:$awsacctid:function:$functionname/invocations > $configdir/.api/resource-integration
+					#aws apigateway put-method-response --rest-api-id $api_id --resource-id $resource_id --http-method POST --status-code 200 --response-models "{\"application/json\": \"Empty\"}" > $configdir/.api/resource-post-response
+					#aws apigateway put-integration-response --rest-api-id $api_id --resource-id $resource_id --http-method POST --status-code 200 --response-templates "{\"application/json\": \"\"}" > $configdir/.api/resource-integration-response
+					dodeploy=1
+				fi
+				aws lambda add-permission --function-name $functionname --statement-id apigateway-prod-2 --action lambda:InvokeFunction --principal apigateway.amazonaws.com --source-arn "arn:aws:execute-api:$awsregion:$awsacctid:$api_id/prod/POST/$functionname" > $configdir/.api/resource-permission
+			elif [ $USE_FST -eq 3 ]
+			then
+				functionname=$namehash$chunk
+				aws lambda add-permission --function-name $functionname --statement-id child-call --action lambda:InvokeFunction --principal $role >/dev/null
+			fi
+			echo -n .
+		done
+		echo
+		if [ $dodeploy -eq 1 ]
+		then
+			# Safety: adhere to AWS Gateway's CreateDeployment limit of 3 rpm; assume 5s minimum time for upload
+			echo "Activating API."
+			sleep 15
+			aws apigateway create-deployment --rest-api-id $api_id --stage-name prod > $configdir/.api/api-deploy
+		fi
+		if [ $USE_FST -eq 3 ]
+		then
+			agghandler=a.f
+			aws lambda delete-function --function-name ${namehash}AGG >/dev/null 2>/dev/null
+			aws lambda create-function --function-name ${namehash}AGG --runtime $runtime --role $role --handler $agghandler --environment "Variables={functionname=$namehash}" --zip-file fileb://$configdir/a.zip >/dev/null
+		fi
+		if [ $USE_TOC -eq 1 ]
+		then
+			echo "Updating file list."
+			aws lambda get-function --function-name TOC 2>/dev/null | python -c "import json,sys; obj=json.load(sys.stdin); print obj['Configuration']['Environment']['Variables']['LB']" > toc 2>/dev/null
+			if [ $? -eq 1 ]
+			then
+				num=0
+			else
+				num=`cat toc`
+				num=$(($num+1))
+			fi
+			rm toc
+			#aws lambda delete-function --function-name TOC$num >/dev/null 2>/dev/null
+			aws lambda create-function --function-name TOC$num --runtime $runtime --role $role --handler $handler --environment "Variables={LB=$2}" --zip-file fileb://$configdir/f.zip >/dev/null
+			aws lambda delete-function --function-name TOC >/dev/null 2>/dev/null
+			aws lambda create-function --function-name TOC --runtime $runtime --role $role --handler $handler --environment "Variables={LB=$num}" --zip-file fileb://$configdir/f.zip >/dev/null
+		fi
+		echo "Backed up $2."
+	;;
+	restore)
+		chunkcount=10240 # sufficient for 40 MB
+		if [ $USE_LEN -eq 1 -a $USE_FST -ne 3 ]
+		then
+			aws lambda get-function --function-name ${namehash}LEN 2>/dev/null | python -c "import json,sys; obj=json.load(sys.stdin); print obj['Configuration']['Environment']['Variables']['LB']" > $namehash.len 2>/dev/null
+			if [ $? -eq 1 ]
+			then
+				echo "Warning: Length record not found for this file."
+			else
+				chunkcount=`cat $namehash.len`
+			fi
+			rm $namehash.len
+			rm -rf $configdir/restore
+		fi
+		if [ ! -d $configdir/restore ]
+		then
+			mkdir -p $configdir/restore
+			dd if=/dev/zero of=$configdir/restore/ref bs=1 count=$chunkcount status=none
+			(cd $configdir/restore && split -b 1 ref LAMBACKUP)
+		fi
+		if [ $chunkcount -eq 10240 ]
+		then
+			echo "Restoring (unknown size) ..."
+		else
+			echo "Restoring ($chunkcount blocks) ..."
+		fi
+		outfile=restored.`basename $2`
+		if [ $USE_FST -ne 3 ]
+		then
+			for chunk in `(cd $configdir/restore && ls LAMBACKUP*)`
+			do
+				if [ $USE_FST -eq 1 ]
+				then
+					aws lambda invoke --function-name $namehash$chunk $chunk.encoded >/dev/null 2>/dev/null
+				elif [ $USE_FST -eq 2 ]
+				then
+					curl -s -X POST -d '{"operation": "f", "payload": {}}' $apigateway/prod/$namehash$chunk > $chunk.encoded
+				else
+					aws lambda get-function --function-name $namehash$chunk 2>/dev/null | python -c "import json,sys; obj=json.load(sys.stdin); print obj['Configuration']['Environment']['Variables']['LB']" > $chunk.encoded 2>/dev/null
+				fi
+				if [ $? -eq 1 ]
+				then
+					rm -f $chunk.encoded
+					break
+				fi
+				if [ $USE_FST -eq 1 ]
+				then
+					sed -i -e 's/"//g' $chunk.encoded
+				fi
+				cat $chunk.encoded | base64plain -d > $chunk
+				echo -n .
+			done
+			rm *.encoded
+			cat LAMBACKUP* > $outfile
+			rm LAMBACKUP*
+		else
+			aws lambda invoke --function-name ${namehash}AGG agg.encoded >/dev/null 2>/dev/null
+			sed -i -e 's/"//g' agg.encoded
+			cat agg.encoded | base64plain -d > $outfile
+			rm agg.encoded
+		fi
+		echo
+		echo "Restored $2 as '$outfile'."
+	;;
+	list)
+		aws lambda get-function --function-name TOC 2>/dev/null | python -c "import json,sys; obj=json.load(sys.stdin); print obj['Configuration']['Environment']['Variables']['LB']" > toc 2>/dev/null
+		if [ $? -eq 1 ]
+		then
+			echo "Warning: No ToC records found."
+		else
+			num=`cat toc`
+			rnum=$(($num+1))
+			echo "$rnum files found with records."
+		fi
+		for i in `seq 0 $num`
+		do
+			aws lambda get-function --function-name TOC$i 2>/dev/null | python -c "import json,sys; obj=json.load(sys.stdin); print obj['Configuration']['Environment']['Variables']['LB']" > toc 2>/dev/null
+			if [ $? -eq 1 ]
+			then
+				echo "Warning: No records for file $i found."
+			else
+				name=`cat toc`
+				echo $name
+			fi
+		done
+		rm toc
+	;;
+esac

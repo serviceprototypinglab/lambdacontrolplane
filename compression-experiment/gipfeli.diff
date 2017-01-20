@@ -1,0 +1,29 @@
+diff --git a/gipfeli_test.cc b/gipfeli_test.cc
+index 362141c..bea7f58 100644
+--- a/gipfeli_test.cc
++++ b/gipfeli_test.cc
+@@ -14,21 +14,14 @@ using std::vector;
+ const char testdata_prefix[] = "testdata/";
+ 
+ const int kRepetitions = 101;
+-const int kFiles = 9;
++const int kFiles = 2;
+ 
+ static struct {
+   const char* label;
+   const char* filename;
+ } files[] = {
+-      {"html", "html"},
+-      {"urls", "urls.10K"},
+-      {"jpg", "fireworks.jpeg"},
+-      {"pdf", "paper-100k.pdf"},
+-      {"html4", "html_x_4"},
+-      {"txt1", "alice29.txt"},
+-      {"txt2", "asyoulik.txt"},
+-      {"txt3", "lcet10.txt"},
+-      {"txt4", "plrabn12.txt"},
++      {"pdf", "jolie.pdf"},
++      {"txt", "Apache-2.0"},
+ };
+ 
+ void ReadTestDataFile(const string& filename, string* content) {

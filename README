@@ -1,0 +1,11 @@
+Lambda Control Plane applications: Lambackup & LaMa
+(☺) 2017 Josef Spillner <josef.spillner@zhaw.ch>
+================================================
+
+Both tools are proof-of-concept applications created for validating the
+hypothesis in the paper 'Exploiting the Cloud Control Plane for Fun and
+Profit'. They need a working AWS account with installed AWS CLI tools.
+
+This repository furthermore contains the reference data and test scripts
+used for the production of this paper for repeatability and
+recomputation of the claimed results.
